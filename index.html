@@ -47,7 +47,7 @@ button{font:inherit;cursor:pointer}
 .primary{background:var(--accent)!important;color:#fff!important;border:0!important}
 .danger{color:var(--out)!important}
 label{display:block;font-size:13px;color:var(--mute);margin:10px 0 4px}
-input[type=datetime-local]{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
+input[type=datetime-local],input#sRepo,input#sTok{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
 dialog{border:0;border-radius:16px;padding:18px;width:min(92vw,420px);background:var(--card);color:var(--ink)}
 dialog::backdrop{background:#0008}
 .dlg .actions{margin-top:12px}
@@ -85,8 +85,9 @@ textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Menlo,monospace;bord
       <button id="export" class="primary">Copy month</button>
       <button id="backup">Backup</button>
       <button id="restore">Restore</button>
+      <button id="sync" style="grid-column:1/3">Cloud sync</button>
     </div>
-    <p class="note">Everything is saved only on this phone. Make a backup now and then.</p>
+    <p class="note" id="syncNote">Everything is saved only on this phone. Make a backup now and then.</p>
   </section>
 </main>
 
@@ -105,6 +106,14 @@ textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Menlo,monospace;bord
   <div class="actions"><button id="eCancel" style="grid-column:1/3">Cancel</button></div>
 </div></dialog>
 
+<dialog id="syncDlg"><div class="dlg">
+  <strong>Cloud sync</strong>
+  <label for="sRepo">Private data repo (owner/name)</label><input id="sRepo" placeholder="ascajc/shift-clock-data" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <label for="sTok">Access token</label><input id="sTok" type="password" placeholder="github_pat_..." autocapitalize="off" autocorrect="off" spellcheck="false">
+  <div class="actions"><button id="sOff" class="danger">Disconnect</button><button id="sGo" class="primary">Save and sync</button></div>
+  <div class="actions"><button id="sClose" style="grid-column:1/3">Close</button></div>
+</div></dialog>
+
 <dialog id="text"><div class="dlg">
   <strong id="textTitle"></strong>
   <textarea id="textArea" spellcheck="false"></textarea>
@@ -113,7 +122,7 @@ textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Menlo,monospace;bord
 </div></dialog>
 
 <script>
-const KEY = "shiftclock.v1";
+const KEY = "shiftclock.v1", TOMB = "shiftclock.tomb", SYNC = "shiftclock.sync";
 const $ = (id) => document.getElementById(id);
 let shifts = [], loadError = false, saveError = false, undo = null, lastTap = 0;
 // Read the records; if the main copy is damaged, fall back to the spare copy. If both fail, never overwrite them.
@@ -125,16 +134,29 @@ function load() {
   return [];
 }
 shifts = load();
+let tombs = {};
+try { tombs = JSON.parse(localStorage.getItem(TOMB)) || {}; } catch (e) {}
 let view = new Date(); view.setDate(1); view.setHours(0, 0, 0, 0);
 let editing = null;
 
-const save = () => {
+// Raw write of the live records and the deleted-record markers.
+const persist = () => {
   if (loadError) return;
   try {
     const old = localStorage.getItem(KEY);
     if (old !== null) localStorage.setItem(KEY + ".bak", old);
-    localStorage.setItem(KEY, JSON.stringify(shifts)); saveError = false;
+    localStorage.setItem(KEY, JSON.stringify(shifts)); localStorage.setItem(TOMB, JSON.stringify(tombs)); saveError = false;
   } catch (e) { saveError = true; }
+};
+// Stamp what changed since the last save (new/edited records get "upd", removed ones become markers), then store and sync.
+const save = () => {
+  if (loadError) return;
+  let prev = [];
+  try { const d = JSON.parse(localStorage.getItem(KEY)); if (Array.isArray(d)) prev = d; } catch (e) {}
+  const pm = new Map(prev.map((x) => [x.id, x])), now = Date.now(), ids = new Set(shifts.map((x) => x.id));
+  for (const r of shifts) { const p = pm.get(r.id); if (!p || p.start !== r.start || p.end !== r.end) { r.upd = now; delete tombs[r.id]; } }
+  for (const p of prev) if (!ids.has(p.id)) tombs[p.id] = now;
+  persist(); queueSync();
 };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 const pad = (n) => String(n).padStart(2, "0");
@@ -293,9 +315,72 @@ $("textRestore").onclick = async () => {
   loadError = false; shifts = data; save(); $("text").close(); render();
 };
 
+// ---- Cloud sync: one JSON file in a private GitHub repo, merged record by record (newest "upd" wins). ----
+const cfg = () => { try { return JSON.parse(localStorage.getItem(SYNC)) || null; } catch (e) { return null; } };
+let syncing = false, syncAgain = false, syncTimer = null;
+const b64 = (t) => btoa(unescape(encodeURIComponent(t))), unb64 = (t) => decodeURIComponent(escape(atob(t.replace(/\s/g, ""))));
+function setSyncNote(m) { $("syncNote").textContent = m || "Everything is saved only on this phone. Make a backup now and then."; }
+function queueSync() { if (!cfg()) return; clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, 2000); }
+function merge(remote) {
+  const loc = new Map();
+  for (const r of shifts) loc.set(r.id, { upd: r.upd || 0, rec: r });
+  for (const [id, u] of Object.entries(tombs)) if (!loc.has(id) || loc.get(id).upd < u) loc.set(id, { upd: u, rec: null });
+  const rem = new Map();
+  for (const r of remote.shifts || []) rem.set(r.id, { upd: r.upd || 0, rec: r });
+  for (const [id, u] of Object.entries(remote.tombs || {})) if (!rem.has(id) || rem.get(id).upd < u) rem.set(id, { upd: u, rec: null });
+  const out = new Map(loc);
+  for (const [id, r] of rem) { const l = loc.get(id); if (!l || r.upd > l.upd) out.set(id, r); }
+  const ns = [], nt = {};
+  for (const [id, x] of out) { if (x.rec) ns.push(x.rec); else nt[id] = x.upd; }
+  return { shifts: ns, tombs: nt };
+}
+const norm = (o) => JSON.stringify({ s: [...(o.shifts || [])].sort((x, y) => x.id < y.id ? -1 : 1), t: Object.fromEntries(Object.entries(o.tombs || {}).sort()) });
+async function syncNow() {
+  const c = cfg();
+  if (!c || loadError) return;
+  if (syncing) { syncAgain = true; return; }
+  syncing = true; setSyncNote("Syncing...");
+  try {
+    const url = "https://api.github.com/repos/" + c.repo + "/contents/shifts.json";
+    const H = { Authorization: "Bearer " + c.token, Accept: "application/vnd.github+json" };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const g = await fetch(url + "?t=" + Date.now(), { headers: H, cache: "no-store" });
+      let remote = { shifts: [], tombs: {} }, sha;
+      if (g.status === 200) { const j = await g.json(); sha = j.sha; remote = JSON.parse(unb64(j.content)); }
+      else if (g.status !== 404) throw new Error(g.status === 401 ? "token rejected" : g.status === 403 ? "token not allowed" : "GitHub error " + g.status);
+      const m = merge(remote);
+      if (norm(m) !== norm(remote)) {
+        const body = { message: "sync " + new Date().toISOString(), content: b64(JSON.stringify(m)) };
+        if (sha) body.sha = sha;
+        const p = await fetch(url, { method: "PUT", headers: H, body: JSON.stringify(body) });
+        if (p.status === 409 || p.status === 422) continue;   // someone wrote in between: fetch again and re-merge
+        if (!p.ok) throw new Error("GitHub error " + p.status);
+      }
+      shifts = m.shifts; tombs = m.tombs; persist(); render();
+      setSyncNote("Synced at " + hm(new Date()) + ".");
+      break;
+    }
+  } catch (e) {
+    setSyncNote("Not synced (" + (e.message === "Failed to fetch" ? "offline" : e.message) + "). Saved on this phone.");
+  }
+  syncing = false;
+  if (syncAgain) { syncAgain = false; queueSync(); }
+}
+$("sync").onclick = () => { const c = cfg(); $("sRepo").value = c ? c.repo : "ascajc/shift-clock-data"; $("sTok").value = ""; $("syncDlg").showModal(); if (document.activeElement) document.activeElement.blur(); };
+$("sClose").onclick = () => $("syncDlg").close();
+$("sGo").onclick = async () => {
+  const repo = $("sRepo").value.trim(), old = cfg(), token = $("sTok").value.trim() || (old && old.token);
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !token) { await tell("Enter the repo as owner/name and paste the token."); return; }
+  localStorage.setItem(SYNC, JSON.stringify({ repo, token })); $("syncDlg").close(); syncNow();
+};
+$("sOff").onclick = async () => { if (await ask("Stop syncing and forget the token on this phone? Your shifts stay here and in the cloud.", "Disconnect", "Cancel")) { localStorage.removeItem(SYNC); $("syncDlg").close(); setSyncNote(""); } };
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") queueSync(); });
+window.addEventListener("online", queueSync);
+
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 render();
+queueSync();
 </script>
 </body>
 </html>
