@@ -51,6 +51,9 @@ input[type=datetime-local]{width:100%;font:inherit;padding:10px;border:1px solid
 dialog{border:0;border-radius:16px;padding:18px;width:min(92vw,420px);background:var(--card);color:var(--ink)}
 dialog::backdrop{background:#0008}
 .dlg .actions{margin-top:12px}
+.toast{position:fixed;left:16px;right:16px;bottom:max(16px,env(safe-area-inset-bottom));max-width:448px;margin:0 auto;background:var(--ink);color:var(--bg);border-radius:14px;padding:12px 14px;display:flex;gap:12px;align-items:center;justify-content:space-between;box-shadow:0 6px 24px #0006;z-index:10;font-size:14px}
+.toast[hidden]{display:none}
+.toast button{border:0;background:var(--accent);color:#fff;border-radius:8px;padding:10px 16px;font-weight:700;flex:none}
 .note{font-size:12px;color:var(--mute);text-align:center;margin:8px 0 0}
 textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--bg);color:var(--ink);margin-top:8px}
 </style>
@@ -73,7 +76,7 @@ textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Menlo,monospace;bord
       <div><b id="tRule">0.00</b><span>hours if the 17:30 rule applies</span></div>
     </div>
     <div id="list"></div>
-    <p class="note">The unpaid half hour after 17:30 counts only in the right-hand total.</p>
+    <p class="note"><b>Right-hand total:</b> your hours if the company takes off the unpaid half hour after 17:30 from every shift that ends later than 17:30. Left-hand total: the hours you actually worked. Compare them with your payslip.</p>
   </section>
 
   <section class="card">
@@ -87,7 +90,14 @@ textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Menlo,monospace;bord
   </section>
 </main>
 
-<dialog id="edit"><div class="dlg">
+<div id="toast" class="toast" hidden></div>
+
+<dialog id="ask"><div class="dlg">
+  <p id="askMsg" style="margin:0 0 4px"></p>
+  <div class="actions"><button id="askNo">Cancel</button><button id="askYes" class="primary">OK</button></div>
+</div></dialog>
+
+<dialog id="edit" autofocus tabindex="-1"><div class="dlg">
   <strong id="editTitle">Shift</strong>
   <label for="eStart">Clocked in</label><input type="datetime-local" id="eStart">
   <label for="eEnd">Clocked out (leave empty if still working)</label><input type="datetime-local" id="eEnd">
@@ -175,10 +185,15 @@ function render() {
   if (loadError) b += `<div class="banner">Your saved records could not be read, so nothing was changed. Use Restore to paste a backup.</div>`;
   if (saveError) b += `<div class="banner">This phone refused to save. Copy a backup now (Backup button), then check Safari's storage settings.</div>`;
   if (stale) b += `<div class="banner">You didn't clock out on ${dayLabel(new Date(o.start))}. Set your finish time.<br><button id="fix">Fix it</button></div>`;
-  if (undo) b += `<div class="banner" style="background:var(--card);color:var(--ink);border:1px solid var(--line)">${undo.text}<br><button id="undoBtn">Undo</button></div>`;
   $("banner").innerHTML = b;
   if (stale) $("fix").onclick = () => openEdit(o);
-  if (undo) $("undoBtn").onclick = () => { shifts = undo.before; undo = null; save(); render(); };
+  // The undo strip floats at the bottom so it never pushes the buttons down under your finger.
+  const t = $("toast");
+  if (undo) {
+    t.hidden = false;
+    t.innerHTML = `<span>${undo.text}<br><small>Tapped by mistake? Undo cancels that tap. Shown for 10 seconds.</small></span><button id="undoBtn">Undo</button>`;
+    $("undoBtn").onclick = () => { shifts = undo.before; undo = null; save(); render(); };
+  } else t.hidden = true;
 }
 
 function tick() {
@@ -191,7 +206,19 @@ function tick() {
   const today = shifts.filter((s) => s.end && new Date(s.start).toDateString() === t).reduce((a, s) => a + hours(s.start, s.end), 0);
   $("today").textContent = today ? "Today so far: " + fmt(today) + " h" : "";
 }
-setInterval(tick, 20000);
+setInterval(tick, 1000);
+
+// Our own pop-up instead of the browser's plain one. ask() resolves true on OK, false on Cancel.
+function ask(msg, yes = "OK", no = "Cancel") {
+  return new Promise((resolve) => {
+    $("askMsg").textContent = msg; $("askYes").textContent = yes; $("askNo").textContent = no;
+    $("askNo").style.display = no ? "" : "none"; $("askYes").style.gridColumn = no ? "" : "1 / 3";
+    const done = (v) => { $("ask").close(); resolve(v); };
+    $("askYes").onclick = () => done(true); $("askNo").onclick = () => done(false);
+    $("ask").showModal();
+  });
+}
+const tell = (msg) => ask(msg, "OK", "");
 
 $("clock").onclick = () => {
   if (Date.now() - lastTap < 2000) return;   // an accidental double tap
@@ -214,23 +241,24 @@ function openEdit(s) {
   $("eEnd").value = editing.end ? local(editing.end) : "";
   $("eDel").style.display = editing.isNew ? "none" : "";
   $("edit").showModal();
+  if (document.activeElement && document.activeElement !== $("edit")) document.activeElement.blur();   // don't pop the date picker open
 }
 $("add").onclick = () => openEdit(null);
 $("eCancel").onclick = () => $("edit").close();
-$("eSave").onclick = () => {
+$("eSave").onclick = async () => {
   const st = $("eStart").value, en = $("eEnd").value;
   if (!st) return;
-  if (en && new Date(en) <= new Date(st)) { alert("The finish time must be after the start."); return; }
+  if (en && new Date(en) <= new Date(st)) { await tell("The finish time must be after the start."); return; }
   const rec = { id: editing.id, start: new Date(st).toISOString(), end: en ? new Date(en).toISOString() : null };
   const a0 = new Date(rec.start), a1 = rec.end ? new Date(rec.end) : new Date(8.64e15);
   const clash = shifts.some((x) => x.id !== rec.id && new Date(x.start) < a1 && (x.end ? new Date(x.end) : new Date(8.64e15)) > a0);
-  if (clash && !confirm("This overlaps another shift, so those hours would be counted twice. Save anyway?")) return;
-  if (!en && shifts.some((x) => x.id !== rec.id && !x.end)) { alert("You already have a shift still open. Finish that one first."); return; }
+  if (clash && !(await ask("This overlaps another shift, so those hours would be counted twice. Save anyway?", "Save anyway", "Go back"))) return;
+  if (!en && shifts.some((x) => x.id !== rec.id && !x.end)) { await tell("You already have a shift still open. Finish that one first."); return; }
   const i = shifts.findIndex((x) => x.id === rec.id);
   if (i >= 0) shifts[i] = rec; else shifts.push(rec);
   save(); $("edit").close(); render();
 };
-$("eDel").onclick = () => { if (confirm("Delete this shift?")) { shifts = shifts.filter((x) => x.id !== editing.id); save(); $("edit").close(); render(); } };
+$("eDel").onclick = async () => { if (await ask("Delete this shift?", "Delete", "Keep it")) { shifts = shifts.filter((x) => x.id !== editing.id); save(); $("edit").close(); render(); } };
 
 function showText(title, text, canRestore) {
   $("textTitle").textContent = title; $("textArea").value = text; $("textArea").readOnly = !canRestore;
@@ -255,13 +283,14 @@ $("export").onclick = () => {
 };
 $("backup").onclick = () => showText("Backup (copy and keep this)", JSON.stringify(shifts), false);
 $("restore").onclick = () => showText("Paste a backup here", "", true);
-$("textRestore").onclick = () => {
+$("textRestore").onclick = async () => {
+  let data;
   try {
-    const data = JSON.parse($("textArea").value);
+    data = JSON.parse($("textArea").value);
     if (!Array.isArray(data) || !data.every((x) => x.id && x.start)) throw 0;
-    if (!confirm("Replace everything on this phone with this backup?")) return;
-    loadError = false; shifts = data; save(); $("text").close(); render();
-  } catch (e) { alert("That doesn't look like a backup."); }
+  } catch (e) { await tell("That doesn't look like a backup."); return; }
+  if (!(await ask("Replace everything on this phone with this backup?", "Replace", "Cancel"))) return;
+  loadError = false; shifts = data; save(); $("text").close(); render();
 };
 
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
