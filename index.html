@@ -105,12 +105,27 @@ textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Menlo,monospace;bord
 <script>
 const KEY = "shiftclock.v1";
 const $ = (id) => document.getElementById(id);
-let shifts = [];
-try { shifts = JSON.parse(localStorage.getItem(KEY) || "[]"); } catch (e) { shifts = []; }
+let shifts = [], loadError = false, saveError = false, undo = null, lastTap = 0;
+// Read the records; if the main copy is damaged, fall back to the spare copy. If both fail, never overwrite them.
+function load() {
+  for (const k of [KEY, KEY + ".bak"]) {
+    try { const raw = localStorage.getItem(k); if (raw === null) continue; const d = JSON.parse(raw); if (Array.isArray(d)) return d; } catch (e) {}
+  }
+  try { if (localStorage.getItem(KEY) !== null) loadError = true; } catch (e) {}
+  return [];
+}
+shifts = load();
 let view = new Date(); view.setDate(1); view.setHours(0, 0, 0, 0);
 let editing = null;
 
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(shifts)); } catch (e) {} };
+const save = () => {
+  if (loadError) return;
+  try {
+    const old = localStorage.getItem(KEY);
+    if (old !== null) localStorage.setItem(KEY + ".bak", old);
+    localStorage.setItem(KEY, JSON.stringify(shifts)); saveError = false;
+  } catch (e) { saveError = true; }
+};
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 const pad = (n) => String(n).padStart(2, "0");
 const hm = (d) => pad(d.getHours()) + ":" + pad(d.getMinutes());
@@ -156,9 +171,14 @@ function render() {
   $("tAll").textContent = fmt(all); $("tRule").textContent = fmt(rule);
 
   const stale = o && new Date(o.start).toDateString() !== new Date().toDateString();
-  $("banner").innerHTML = stale
-    ? `<div class="banner">You didn't clock out on ${dayLabel(new Date(o.start))}. Set your finish time.<br><button id="fix">Fix it</button></div>` : "";
+  let b = "";
+  if (loadError) b += `<div class="banner">Your saved records could not be read, so nothing was changed. Use Restore to paste a backup.</div>`;
+  if (saveError) b += `<div class="banner">This phone refused to save. Copy a backup now (Backup button), then check Safari's storage settings.</div>`;
+  if (stale) b += `<div class="banner">You didn't clock out on ${dayLabel(new Date(o.start))}. Set your finish time.<br><button id="fix">Fix it</button></div>`;
+  if (undo) b += `<div class="banner" style="background:var(--card);color:var(--ink);border:1px solid var(--line)">${undo.text}<br><button id="undoBtn">Undo</button></div>`;
+  $("banner").innerHTML = b;
   if (stale) $("fix").onclick = () => openEdit(o);
+  if (undo) $("undoBtn").onclick = () => { shifts = undo.before; undo = null; save(); render(); };
 }
 
 function tick() {
@@ -174,8 +194,13 @@ function tick() {
 setInterval(tick, 20000);
 
 $("clock").onclick = () => {
-  const o = openShift();
-  if (o) o.end = new Date().toISOString(); else shifts.push({ id: uid(), start: new Date().toISOString(), end: null });
+  if (Date.now() - lastTap < 2000) return;   // an accidental double tap
+  lastTap = Date.now();
+  const before = JSON.parse(JSON.stringify(shifts)), o = openShift();
+  const now = new Date();
+  if (o) o.end = now.toISOString(); else shifts.push({ id: uid(), start: now.toISOString(), end: null });
+  const mark = undo = { before, text: (o ? "Clocked out at " : "Clocked in at ") + hm(now) + "." };
+  setTimeout(() => { if (undo === mark) { undo = null; render(); } }, 10000);
   save(); render();
   if (navigator.vibrate) navigator.vibrate(30);
 };
@@ -197,6 +222,10 @@ $("eSave").onclick = () => {
   if (!st) return;
   if (en && new Date(en) <= new Date(st)) { alert("The finish time must be after the start."); return; }
   const rec = { id: editing.id, start: new Date(st).toISOString(), end: en ? new Date(en).toISOString() : null };
+  const a0 = new Date(rec.start), a1 = rec.end ? new Date(rec.end) : new Date(8.64e15);
+  const clash = shifts.some((x) => x.id !== rec.id && new Date(x.start) < a1 && (x.end ? new Date(x.end) : new Date(8.64e15)) > a0);
+  if (clash && !confirm("This overlaps another shift, so those hours would be counted twice. Save anyway?")) return;
+  if (!en && shifts.some((x) => x.id !== rec.id && !x.end)) { alert("You already have a shift still open. Finish that one first."); return; }
   const i = shifts.findIndex((x) => x.id === rec.id);
   if (i >= 0) shifts[i] = rec; else shifts.push(rec);
   save(); $("edit").close(); render();
@@ -231,7 +260,7 @@ $("textRestore").onclick = () => {
     const data = JSON.parse($("textArea").value);
     if (!Array.isArray(data) || !data.every((x) => x.id && x.start)) throw 0;
     if (!confirm("Replace everything on this phone with this backup?")) return;
-    shifts = data; save(); $("text").close(); render();
+    loadError = false; shifts = data; save(); $("text").close(); render();
   } catch (e) { alert("That doesn't look like a backup."); }
 };
 
